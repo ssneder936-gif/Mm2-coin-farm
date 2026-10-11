@@ -1,4 +1,4 @@
--- MM2 Coin Farm — MainCoin scan, 27 studs/sec fly, in-map bounds, no inter-coin wait
+-- MM2 Coin Farm — idle-normal mode when no coins in range
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -20,12 +20,34 @@ local state = {
     noclip        = true,
     antiAFK       = true,
     platformStand = true,
-    ceilingPad    = 5,
-    floorPad      = 5,
+    ceilingPad    = 3,
+    floorPad      = 3,
     floatY        = nil,
     floatAmp      = 1.5,
     floatFreq     = 0.8,
+    flatFlight    = true,
+    underMapDrop  = 60,
+    transitRadius = 8,
+    maxRange      = 1000,
+    bounds        = nil,
+    collected     = {},
+    paused        = false,
+    idleNormal    = false,       -- true = no coins in range, effects off
 }
+
+------------------------------------------------------------
+-- ALIVE CHECK
+------------------------------------------------------------
+local function isAlive()
+    local char = player.Character
+    if not char or char.Parent ~= workspace then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return false end
+    if hum.Health <= 0 then return false end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    return true
+end
 
 ------------------------------------------------------------
 -- MAINCOIN RESOLVER
@@ -49,16 +71,28 @@ local function coinPos(coin) return coin.Position end
 
 local function computeBounds()
     local coins = resolveCoins()
-    if #coins == 0 then return nil end
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
     local minY, maxY = math.huge, -math.huge
     for _, c in ipairs(coins) do
         local y = c.Position.Y
         if y < minY then minY = y end
         if y > maxY then maxY = y end
     end
+
+    if hrp then
+        local py = hrp.Position.Y
+        if py < minY then minY = py end
+        if py > maxY then maxY = py end
+    end
+
+    if minY == math.huge then return nil end
+
     return {
         minY = minY - state.floorPad,
         maxY = maxY + state.ceilingPad,
+        coinMinY = minY,
     }
 end
 
@@ -69,8 +103,12 @@ local function nearestCoin()
     local coins = resolveCoins()
     local best, bestDist = nil, math.huge
     for _, c in ipairs(coins) do
-        local d = (hrp.Position - c.Position).Magnitude
-        if d < bestDist then best, bestDist = c, d end
+        if not state.collected[c] then
+            local d = (hrp.Position - c.Position).Magnitude
+            if d <= state.maxRange and d < bestDist then
+                best, bestDist = c, d
+            end
+        end
     end
     return best, bestDist, #coins
 end
@@ -208,8 +246,23 @@ local function suppressCollisionStates()
     end
 end
 
+local function releaseNormalState()
+    local char = player.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function() hum.PlatformStand = false end)
+        pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true) end)
+        pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true) end)
+    end
+    applyNoclipToCharacter(char, false)
+end
+
 RunService.Stepped:Connect(function()
     if not state.noclip then return end
+    if state.paused then return end
+    if state.idleNormal then return end
+    if not isAlive() then return end
     local char = player.Character
     if not char then return end
     for _, d in ipairs(char:GetDescendants()) do
@@ -220,84 +273,156 @@ RunService.Stepped:Connect(function()
 end)
 
 player.CharacterAdded:Connect(function(char)
-    if not state.noclip then return end
-    task.wait(0.1)
-    applyNoclipToCharacter(char, true)
-    suppressCollisionStates()
+    if not state.noclip or not state.farming then return end
+    task.wait(0.15)
+    if isAlive() and not state.idleNormal then
+        applyNoclipToCharacter(char, true)
+        suppressCollisionStates()
+    end
 end)
 
-applyNoclipToCharacter(player.Character, state.noclip)
+------------------------------------------------------------
+-- ORIENTATION
+------------------------------------------------------------
+local function writeFlat(hrp, look)
+    if not hrp then return end
+    if not look or look.Magnitude < 0.01 then look = Vector3.new(0, 0, -1) end
+    look = Vector3.new(look.X, 0, look.Z)
+    if look.Magnitude < 0.01 then look = Vector3.new(0, 0, -1) end
+    look = look.Unit
+    hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + look, Vector3.new(0, 1, 0))
+end
+
+local function writeUpright(hrp, look)
+    if not hrp then return end
+    if not look or look.Magnitude < 0.01 then look = Vector3.new(0, 0, -1) end
+    look = Vector3.new(look.X, 0, look.Z)
+    if look.Magnitude < 0.01 then look = Vector3.new(0, 0, -1) end
+    look = look.Unit
+    hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + look, Vector3.new(0, 1, 0))
+end
 
 ------------------------------------------------------------
--- FLY (no wait between coins)
+-- FLY
 ------------------------------------------------------------
 local function getHRP()
     local char = player.Character
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
-local function clampToMap(pos, bounds)
-    if not bounds then return pos end
-    local y = math.clamp(pos.Y, bounds.minY, bounds.maxY)
-    return Vector3.new(pos.X, y, pos.Z)
-end
-
-local function flyTo(targetPos, bounds)
+local function flyToward(goal, bounds, orientation)
     local hrp = getHRP()
     if not hrp then return false end
 
-    local goal = clampToMap(targetPos + state.offset, bounds)
-
-    hrp.AssemblyLinearVelocity  = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
+    local goalY = goal.Y
+    if bounds and orientation ~= "undermap" then
+        goalY = math.clamp(goalY, bounds.minY, bounds.maxY)
+    end
 
     local done = false
     local conn
     conn = RunService.Heartbeat:Connect(function(dt)
         if done then return end
+        if state.paused then done = true return end
+        if state.idleNormal then done = true return end
+        if not isAlive() then done = true return end
+
         local cur = hrp.Position
-        local delta = goal - cur
+        local target = Vector3.new(goal.X, goalY, goal.Z)
+        local delta = target - cur
         local dist = delta.Magnitude
 
         if dist < 1.5 then
-            hrp.CFrame = CFrame.new(clampToMap(goal, bounds))
+            local fy = goalY
+            if bounds and orientation ~= "undermap" then
+                fy = math.clamp(fy, bounds.minY, bounds.maxY)
+            end
+            local look = Vector3.new(delta.X, 0, delta.Z)
+            local pos = Vector3.new(goal.X, fy, goal.Z)
+
+            if orientation == "flat" then
+                writeFlat(hrp, look)
+            else
+                writeUpright(hrp, look)
+            end
+            hrp.CFrame = CFrame.new(pos) * (hrp.CFrame - hrp.CFrame.Position)
             done = true
             return
         end
 
         local step = math.min(state.flySpeed * dt, dist)
-        local newPos = clampToMap(cur + delta.Unit * step, bounds)
-        hrp.CFrame = CFrame.new(newPos, newPos + delta.Unit)
+        local newPos = cur + delta.Unit * step
+        local ny = newPos.Y
+        if bounds and orientation ~= "undermap" then
+            ny = math.clamp(ny, bounds.minY, bounds.maxY)
+        end
+        newPos = Vector3.new(newPos.X, ny, newPos.Z)
+
+        local look = Vector3.new(delta.X, 0, delta.Z)
+        if orientation == "flat" then
+            writeFlat(hrp, look)
+        else
+            writeUpright(hrp, look)
+        end
+        hrp.CFrame = CFrame.new(newPos) * (hrp.CFrame - hrp.CFrame.Position)
+
         hrp.AssemblyLinearVelocity  = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
     end)
 
-    local timeout = tick() + 20
+    local timeout = tick() + 25
     while not done and tick() < timeout do
         task.wait(0.03)
         if not state.farming then break end
+        if state.paused then break end
+        if state.idleNormal then break end
     end
     conn:Disconnect()
     return done
 end
 
 ------------------------------------------------------------
--- IDLE FLOAT (only used when no coin exists)
+-- COIN CYCLE
 ------------------------------------------------------------
-local function floatTick()
-    local char = player.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+local function approachCoin(coin, bounds)
+    local hrp = getHRP()
     if not hrp then return end
-    if state.floatY == nil then state.floatY = hrp.Position.Y end
+    local cpos = coinPos(coin)
 
-    local t = tick() * state.floatFreq * math.pi * 2
-    local bob = math.sin(t) * state.floatAmp
-    local targetY = state.floatY + bob
+    local transitY = cpos.Y - state.underMapDrop
+    if bounds then
+        transitY = math.min(transitY, bounds.coinMinY - state.underMapDrop)
+    end
 
-    local cur = hrp.Position
-    hrp.CFrame = CFrame.new(Vector3.new(cur.X, targetY, cur.Z))
-    hrp.AssemblyLinearVelocity  = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
+    local startX = hrp.Position.X + state.transitRadius
+    local startZ = hrp.Position.Z
+    flyToward(Vector3.new(startX, transitY, startZ), bounds, "flat")
+    flyToward(Vector3.new(cpos.X, transitY, cpos.Z), bounds, "flat")
+
+    local finalY = cpos.Y + state.offset.Y
+    if bounds then finalY = math.clamp(finalY, bounds.minY, bounds.maxY) end
+    flyToward(Vector3.new(cpos.X, finalY, cpos.Z), bounds, "upright")
+end
+
+------------------------------------------------------------
+-- ENTER / EXIT IDLE-NORMAL
+------------------------------------------------------------
+local function enterIdleNormal()
+    if state.idleNormal then return end
+    state.idleNormal = true
+    -- turn off all effects
+    releaseNormalState()
+    status.Text = "no coins in range — normal mode"
+end
+
+local function exitIdleNormal()
+    if not state.idleNormal then return end
+    state.idleNormal = false
+    -- effects will be reapplied by the farm loop on next tick
+    if state.noclip and isAlive() then
+        applyNoclipToCharacter(player.Character, true)
+        suppressCollisionStates()
+    end
 end
 
 ------------------------------------------------------------
@@ -308,25 +433,48 @@ local farmConn
 local function startFarm()
     if farmConn then return end
 
-    applyNoclipToCharacter(player.Character, true)
-    suppressCollisionStates()
+    state.collected = {}
+    state.paused = false
+    state.idleNormal = false
 
     farmConn = task.spawn(function()
         while state.farming do
-            local coin, dist, count = nearestCoin()
-            if coin then
-                local bounds = computeBounds()
-                status.Text = string.format("coins: %d | fly %.0f", count or 0, dist or 0)
-                if state.noclip then
-                    applyNoclipToCharacter(player.Character, true)
-                    suppressCollisionStates()
-                end
-                -- fly straight to the next coin, no wait
-                flyTo(coinPos(coin), bounds)
+            if not isAlive() then
+                state.paused = true
+                status.Text = "dead / not spawned — paused"
+                task.wait(0.5)
             else
-                status.Text = "no MainCoin — floating"
-                floatTick()
-                task.wait(0.05)
+                if state.paused then
+                    state.paused = false
+                    state.collected = {}
+                    state.bounds = computeBounds()
+                    state.floatY = nil
+                    local hrp = getHRP()
+                    if hrp then state.floatY = hrp.Position.Y end
+                end
+
+                local coin, dist, count = nearestCoin()
+                if coin then
+                    -- came back into range → exit idle normal
+                    exitIdleNormal()
+
+                    state.bounds = computeBounds()
+                    local n = 0
+                    for _ in pairs(state.collected) do n = n + 1 end
+                    status.Text = string.format("coins: %d | fly %.0f | collected: %d",
+                        count or 0, dist or 0, n)
+                    if state.noclip then
+                        applyNoclipToCharacter(player.Character, true)
+                        suppressCollisionStates()
+                    end
+                    approachCoin(coin, state.bounds)
+                    state.collected[coin] = true
+                    task.wait(0.15)
+                else
+                    -- no reachable coin → strip all effects, wait normal
+                    enterIdleNormal()
+                    task.wait(0.5)
+                end
             end
         end
     end)
@@ -334,18 +482,25 @@ end
 
 local function stopFarm()
     state.farming = false
+    state.paused = false
     if farmConn then
         pcall(function() task.cancel(farmConn) end)
         farmConn = nil
     end
     state.floatY = nil
+    state.bounds = nil
+    state.idleNormal = false
     state.noclip = false
     applyNoclipToCharacter(player.Character, false)
     local char = player.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if hum then
         pcall(function() hum.PlatformStand = false end)
+        pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true) end)
+        pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true) end)
     end
+    local hrp = getHRP()
+    if hrp then writeUpright(hrp, hrp.CFrame.LookVector) end
 end
 
 ------------------------------------------------------------
@@ -356,11 +511,30 @@ track.MouseButton1Click:Connect(function()
     render(state.farming)
     if state.farming then
         state.noclip = true
-        applyNoclipToCharacter(player.Character, true)
+        state.paused = false
+        state.idleNormal = false
+        if isAlive() then
+            applyNoclipToCharacter(player.Character, true)
+            suppressCollisionStates()
+        end
         startFarm()
+        status.Text = isAlive() and "farm on" or "waiting for spawn..."
     else
         stopFarm()
         status.Text = "stopped — noclip off"
+    end
+end)
+
+player.CharacterAdded:Connect(function()
+    state.collected = {}
+    state.bounds = nil
+    state.floatY = nil
+    if state.farming and state.noclip and not state.idleNormal then
+        task.wait(0.2)
+        if isAlive() then
+            applyNoclipToCharacter(player.Character, true)
+            suppressCollisionStates()
+        end
     end
 end)
 
@@ -374,7 +548,9 @@ end
 function setNoclip(b)
     state.noclip = b
     print("[MM2] noclip", b)
-    applyNoclipToCharacter(player.Character, b)
+    if isAlive() and not state.idleNormal then
+        applyNoclipToCharacter(player.Character, b)
+    end
 end
 function setAntiAFK(b)      state.antiAFK = b print("[MM2] antiAFK", b) end
 function setPlatformStand(b)
@@ -395,6 +571,19 @@ function setFloat(amp, freq)
     state.floatFreq = freq
     print("[MM2] float amp", amp, "freq", freq)
 end
+function setFlatFlight(b)
+    state.flatFlight = b
+    print("[MM2] flatFlight", b)
+end
+function setTransit(drop, radius)
+    state.underMapDrop = drop
+    state.transitRadius = radius
+    print("[MM2] underMapDrop", drop, "transitRadius", radius)
+end
+function setMaxRange(r)
+    state.maxRange = r
+    print("[MM2] maxRange", r)
+end
 
 function listCoins()
     local coins = resolveCoins()
@@ -407,17 +596,44 @@ end
 function showBounds()
     local b = computeBounds()
     if not b then print("[MM2] no bounds — no coins") return end
-    print("[MM2] bounds y:", b.minY, "to", b.maxY)
+    print("[MM2] bounds y:", b.minY, "to", b.maxY, "coinMinY:", b.coinMinY)
+end
+
+function clearCollected()
+    state.collected = {}
+    print("[MM2] collected set cleared")
+end
+
+function collectedCount()
+    local n = 0
+    for _ in pairs(state.collected) do n = n + 1 end
+    print("[MM2] collected:", n)
+end
+
+function statusNow()
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    print("[MM2] farming:", state.farming,
+          "paused:", state.paused,
+          "idleNormal:", state.idleNormal,
+          "alive:", isAlive(),
+          "health:", hum and hum.Health or "n/a")
 end
 
 function goNearestOnce()
+    if not isAlive() then print("[MM2] not alive") return end
     local coin, dist = nearestCoin()
-    if not coin then print("[MM2] no MainCoin") return end
-    local bounds = computeBounds()
+    if not coin then
+        print("[MM2] no uncollected MainCoin within", state.maxRange)
+        return
+    end
+    exitIdleNormal()
+    state.bounds = computeBounds()
     print("[MM2] nearest:", coin:GetFullName(), dist)
     applyNoclipToCharacter(player.Character, true)
     suppressCollisionStates()
-    flyTo(coinPos(coin), bounds)
+    approachCoin(coin, state.bounds)
+    state.collected[coin] = true
 end
 
 function noclipStatus()
@@ -440,9 +656,15 @@ _G.setPlatformStand = setPlatformStand
 _G.setOffset        = setOffset
 _G.setPads          = setPads
 _G.setFloat         = setFloat
+_G.setFlatFlight    = setFlatFlight
+_G.setTransit       = setTransit
+_G.setMaxRange      = setMaxRange
 _G.listCoins        = listCoins
 _G.showBounds       = showBounds
+_G.clearCollected   = clearCollected
+_G.collectedCount   = collectedCount
+_G.statusNow        = statusNow
 _G.goNearestOnce    = goNearestOnce
 _G.noclipStatus     = noclipStatus
 
-print("[MM2] loaded. continuous fly, no inter-coin wait.")
+print("[MM2] loaded. idle-normal when no coins in range.")
