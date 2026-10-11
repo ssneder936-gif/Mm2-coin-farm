@@ -1,11 +1,10 @@
--- MM2 Coin Farm — MainCoin scan, 27 studs/sec fly, in-map bounds, float-between-hops, noclip toggleable
+-- MM2 Coin Farm — MainCoin scan, 27 studs/sec fly, in-map bounds, no inter-coin wait
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
 local CoreGui      = game:GetService("CoreGui")
 local VirtualUser  = game:GetService("VirtualUser")
 local player       = Players.LocalPlayer
-local camera       = workspace.CurrentCamera
 
 if CoreGui:FindFirstChild("MM2CoinFarm") then
     CoreGui.MM2CoinFarm:Destroy()
@@ -17,7 +16,6 @@ end
 local state = {
     farming       = false,
     flySpeed      = 27,
-    hopInterval   = 2.0,       -- seconds spent floating between coins
     offset        = Vector3.new(0, 3, 0),
     noclip        = true,
     antiAFK       = true,
@@ -176,7 +174,7 @@ player.Idled:Connect(function()
 end)
 
 ------------------------------------------------------------
--- NOCLIP (gated by state.noclip)
+-- NOCLIP
 ------------------------------------------------------------
 local function applyNoclipToCharacter(char, on)
     if not char then return end
@@ -228,62 +226,10 @@ player.CharacterAdded:Connect(function(char)
     suppressCollisionStates()
 end)
 
--- apply now based on current toggle
 applyNoclipToCharacter(player.Character, state.noclip)
 
 ------------------------------------------------------------
--- FLOAT (idle hold + bob)
-------------------------------------------------------------
-local floatConn
-
-local function startFloat()
-    if floatConn then return end
-    local char = player.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        state.floatY = hrp.Position.Y
-    end
-
-    floatConn = RunService.Heartbeat:Connect(function(dt)
-        if not state.farming then return end
-        if state.floatY == nil then return end
-
-        local c = player.Character
-        local h = c and c:FindFirstChild("HumanoidRootPart")
-        if not h then return end
-
-        local t = tick() * state.floatFreq * math.pi * 2
-        local bob = math.sin(t) * state.floatAmp
-        local targetY = state.floatY + bob
-
-        local cur = h.Position
-        h.CFrame = CFrame.new(Vector3.new(cur.X, targetY, cur.Z))
-        h.AssemblyLinearVelocity  = Vector3.zero
-        h.AssemblyAngularVelocity = Vector3.zero
-    end)
-end
-
-local function stopFloat()
-    if floatConn then
-        floatConn:Disconnect()
-        floatConn = nil
-    end
-    state.floatY = nil
-end
-
-local function pauseFloat()
-    if floatConn then
-        floatConn:Disconnect()
-        floatConn = nil
-    end
-end
-
-local function resumeFloat()
-    if not floatConn then startFloat() end
-end
-
-------------------------------------------------------------
--- FLY
+-- FLY (no wait between coins)
 ------------------------------------------------------------
 local function getHRP()
     local char = player.Character
@@ -314,15 +260,13 @@ local function flyTo(targetPos, bounds)
         local dist = delta.Magnitude
 
         if dist < 1.5 then
-            local clamped = clampToMap(goal, bounds)
-            hrp.CFrame = CFrame.new(clamped)
+            hrp.CFrame = CFrame.new(clampToMap(goal, bounds))
             done = true
             return
         end
 
         local step = math.min(state.flySpeed * dt, dist)
-        local newPos = cur + delta.Unit * step
-        newPos = clampToMap(newPos, bounds)
+        local newPos = clampToMap(cur + delta.Unit * step, bounds)
         hrp.CFrame = CFrame.new(newPos, newPos + delta.Unit)
         hrp.AssemblyLinearVelocity  = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
@@ -338,35 +282,22 @@ local function flyTo(targetPos, bounds)
 end
 
 ------------------------------------------------------------
--- FLOAT FOR DURATION (used between hops)
+-- IDLE FLOAT (only used when no coin exists)
 ------------------------------------------------------------
-local function floatFor(seconds)
+local function floatTick()
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
+    if state.floatY == nil then state.floatY = hrp.Position.Y end
 
-    -- lock Y at current
-    state.floatY = hrp.Position.Y
-    local t0 = tick()
+    local t = tick() * state.floatFreq * math.pi * 2
+    local bob = math.sin(t) * state.floatAmp
+    local targetY = state.floatY + bob
 
-    while tick() - t0 < seconds do
-        if not state.farming then break end
-        local c = player.Character
-        local h = c and c:FindFirstChild("HumanoidRootPart")
-        if not h then break end
-
-        local elapsed = tick() - t0
-        local t = elapsed * state.floatFreq * math.pi * 2
-        local bob = math.sin(t) * state.floatAmp
-        local targetY = state.floatY + bob
-
-        local cur = h.Position
-        h.CFrame = CFrame.new(Vector3.new(cur.X, targetY, cur.Z))
-        h.AssemblyLinearVelocity  = Vector3.zero
-        h.AssemblyAngularVelocity = Vector3.zero
-
-        task.wait(0.03)
-    end
+    local cur = hrp.Position
+    hrp.CFrame = CFrame.new(Vector3.new(cur.X, targetY, cur.Z))
+    hrp.AssemblyLinearVelocity  = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
 end
 
 ------------------------------------------------------------
@@ -390,20 +321,12 @@ local function startFarm()
                     applyNoclipToCharacter(player.Character, true)
                     suppressCollisionStates()
                 end
+                -- fly straight to the next coin, no wait
                 flyTo(coinPos(coin), bounds)
-
-                -- float for hopInterval between each grab
-                status.Text = string.format("floating %.1fs before next coin", state.hopInterval)
-                floatFor(state.hopInterval)
-
-                -- reset floatY for next flight
-                local hrp = getHRP()
-                if hrp then state.floatY = hrp.Position.Y end
             else
-                status.Text = "no MainCoin — floating in place"
-                -- hold position indefinitely until a coin appears
-                state.floatY = state.floatY or (getHRP() and getHRP().Position.Y)
-                floatFor(0.5)
+                status.Text = "no MainCoin — floating"
+                floatTick()
+                task.wait(0.05)
             end
         end
     end)
@@ -415,12 +338,10 @@ local function stopFarm()
         pcall(function() task.cancel(farmConn) end)
         farmConn = nil
     end
-    stopFloat()
-
-    -- turn noclip off on toggle-off
+    state.floatY = nil
     state.noclip = false
+    applyNoclipToCharacter(player.Character, false)
     local char = player.Character
-    applyNoclipToCharacter(char, false)
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if hum then
         pcall(function() hum.PlatformStand = false end)
@@ -450,7 +371,6 @@ function setFlySpeed(s)
     state.flySpeed = math.clamp(s, 1, 27)
     print("[MM2] flySpeed", state.flySpeed)
 end
-function setHopInterval(s)  state.hopInterval = s print("[MM2] hopInterval", s) end
 function setNoclip(b)
     state.noclip = b
     print("[MM2] noclip", b)
@@ -514,7 +434,6 @@ function noclipStatus()
 end
 
 _G.setFlySpeed      = setFlySpeed
-_G.setHopInterval   = setHopInterval
 _G.setNoclip        = setNoclip
 _G.setAntiAFK       = setAntiAFK
 _G.setPlatformStand = setPlatformStand
@@ -526,4 +445,4 @@ _G.showBounds       = showBounds
 _G.goNearestOnce    = goNearestOnce
 _G.noclipStatus     = noclipStatus
 
-print("[MM2] loaded. float-between-hops. noclip toggles with switch.")
+print("[MM2] loaded. continuous fly, no inter-coin wait.")
